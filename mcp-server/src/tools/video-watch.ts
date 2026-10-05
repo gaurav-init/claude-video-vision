@@ -25,7 +25,7 @@ import {
 } from "../utils/video-source.js";
 import { getSessionDir, loadManifest, saveManifest, computeVideoHash } from "../session/manager.js";
 import { createManifest, frameCacheKey, mergeFrames, sampleFrameIndices } from "../session/manifest.js";
-import type { AudioResult, VideoWatchResult, Frame, Segment, SessionManifest } from "../types.js";
+import type { AudioResult, VideoWatchResult, Frame, FrameFormat, Segment, SessionManifest } from "../types.js";
 
 const CONFIG_PATH = join(homedir(), ".claude-video-vision", "config.json");
 
@@ -44,6 +44,41 @@ Available backends:
 
 function timestampToFormattedFilename(timestamp: string, extension: string): string {
   return `${timestamp.replace(/:/g, "-")}.${extension}`;
+}
+
+/**
+ * Copies extracted frames into the session cache under stable,
+ * timestamp-keyed filenames and indexes those copies in the manifest.
+ * ffmpeg's frame_XXXX names restart on every run, so they must never be
+ * referenced from the manifest directly.
+ */
+export function persistFramesToSession(
+  manifest: SessionManifest,
+  sessionDir: string,
+  frameFormat: FrameFormat,
+  frames: { timestamp: string; resolution: number | string; sourcePath?: string }[],
+): SessionManifest {
+  const extension = frameFormatExtension(frameFormat);
+  const entriesByCacheKey = new Map<string, { timestamp: string; file: string }[]>();
+
+  for (const frame of frames) {
+    if (!frame.sourcePath) continue;
+
+    const resDir = join(sessionDir, "frames", frameFormat, String(frame.resolution));
+    mkdirSync(resDir, { recursive: true });
+    const filePath = join(resDir, timestampToFormattedFilename(frame.timestamp, extension));
+    copyFileSync(frame.sourcePath, filePath);
+
+    const cacheKey = frameCacheKey(frame.resolution, frameFormat);
+    const entries = entriesByCacheKey.get(cacheKey) ?? [];
+    entries.push({ timestamp: frame.timestamp, file: filePath });
+    entriesByCacheKey.set(cacheKey, entries);
+  }
+
+  for (const [cacheKey, entries] of entriesByCacheKey) {
+    manifest = mergeFrames(manifest, cacheKey, entries);
+  }
+  return manifest;
 }
 
 export interface DeriveFpsParams {
@@ -103,7 +138,6 @@ export function registerVideoWatch(server: McpServer): void {
       const resolved = await resolveVideoInputDetailed(params.path);
       const safePath = resolved.path;
       const frameFormat = params.frame_format || config.frame_format;
-      const frameExtension = frameFormatExtension(frameFormat);
       const frameMimeType = frameFormatMimeType(frameFormat);
 
       // Session support
@@ -139,192 +173,175 @@ export function registerVideoWatch(server: McpServer): void {
       // 3. Prepare work dir
       const workDir = join(tmpdir(), `cvv-${Date.now()}`);
       mkdirSync(workDir, { recursive: true });
-      const framesDir = join(workDir, "frames");
 
-      // 4. Run frame extraction and audio processing
-      //    When segments are provided, frame extraction is sequential (per segment);
-      //    audio can still run in parallel with the entire segment batch.
+      try {
+        const framesDir = join(workDir, "frames");
 
-      let framesPromise: Promise<Frame[]>;
+        // 4. Run frame extraction and audio processing
+        //    When segments are provided, frame extraction is sequential (per segment);
+        //    audio can still run in parallel with the entire segment batch.
 
-      if (params.segments && params.segments.length > 0) {
-        const extractDir = useSession ? join(sessionDir!, "frames", frameFormat) : join(workDir, "frames");
-        framesPromise = extractFramesBySegments(safePath, params.segments as Segment[], extractDir, frameFormat).then((segmentFrames) => {
-          if (useSession && manifest) {
-            for (const frame of segmentFrames) {
-              if (!frame.sourcePath) continue;
+        let framesPromise: Promise<Frame[]>;
 
-              const res = String(frame.resolution);
-              const cacheKey = frameCacheKey(res, frameFormat);
-              manifest = mergeFrames(manifest!, cacheKey, [
-                { timestamp: frame.timestamp, file: frame.sourcePath },
-              ]);
+        if (params.segments && params.segments.length > 0) {
+          framesPromise = extractFramesBySegments(safePath, params.segments as Segment[], framesDir, frameFormat).then((segmentFrames) => {
+            if (useSession && manifest && sessionDir) {
+              manifest = persistFramesToSession(manifest, sessionDir, frameFormat, segmentFrames);
             }
-          }
-          return segmentFrames;
-        });
-      } else {
-        framesPromise = extractFrames(safePath, {
-          fps,
-          resolution,
-          outputDir: framesDir,
-          format: frameFormat,
-          startTime: params.start_time,
-          endTime: params.end_time,
-          maxFrames: config.max_frames,
-        }).then((extractedFrames) => {
-          if (useSession && manifest && sessionDir) {
-            const cacheKey = frameCacheKey(resolution, frameFormat);
-            const resDir = join(sessionDir, "frames", frameFormat, String(resolution));
-            mkdirSync(resDir, { recursive: true });
-
-            const manifestEntries: { timestamp: string; file: string }[] = [];
-            for (const frame of extractedFrames) {
-              if (!frame.sourcePath) continue;
-
-              const filePath = join(resDir, timestampToFormattedFilename(frame.timestamp, frameExtension));
-              copyFileSync(frame.sourcePath, filePath);
-              manifestEntries.push({ timestamp: frame.timestamp, file: filePath });
-            }
-
-            manifest = mergeFrames(manifest, cacheKey, manifestEntries);
-          }
-
-          return extractedFrames;
-        });
-      }
-
-      let audioPromise: Promise<AudioResult>;
-
-      if (params.skip_audio || !metadata.has_audio) {
-        audioPromise = Promise.resolve({ backend: "none" as const, transcription: [], audio_tags: [], full_analysis: null });
-      } else if (captionFallbackReason === null && resolved.captions) {
-        audioPromise = Promise.resolve(
-          buildCaptionAudioResult(resolved.captions, {
+            return segmentFrames;
+          });
+        } else {
+          framesPromise = extractFrames(safePath, {
+            fps,
+            resolution,
+            outputDir: framesDir,
+            format: frameFormat,
             startTime: params.start_time,
             endTime: params.end_time,
-          }),
-        );
-      } else if (config.backend === "gemini-api") {
-        audioPromise = analyzeWithGeminiApi(safePath, config, {
-          startTime: params.start_time,
-          endTime: params.end_time,
-        });
-      } else if (config.backend === "openai") {
-        const audioDir = join(workDir, "audio");
-        audioPromise = extractAudio(safePath, audioDir, {
-          startTime: params.start_time,
-          endTime: params.end_time,
-        }).then((wavPath) => transcribeWithOpenAI(wavPath));
-      } else {
-        // local
-        const audioDir = join(workDir, "audio");
-        const modelDir = join(homedir(), ".claude-video-vision", "models");
-        audioPromise = extractAudio(safePath, audioDir, {
-          startTime: params.start_time,
-          endTime: params.end_time,
-        }).then((wavPath) =>
-          transcribeWithWhisper(wavPath, {
-            engine: config.whisper_engine,
-            model: config.whisper_model,
-            whisperAt: config.whisper_at,
-            modelDir,
-          }),
-        );
-      }
+            maxFrames: config.max_frames,
+          }).then((extractedFrames) => {
+            if (useSession && manifest && sessionDir) {
+              manifest = persistFramesToSession(
+                manifest,
+                sessionDir,
+                frameFormat,
+                extractedFrames.map((frame) => ({ ...frame, resolution })),
+              );
+            }
 
-      let [frames, rawAudio] = await Promise.all([framesPromise, audioPromise]);
-
-      if (captionFallbackReason !== null && rawAudio.backend !== "youtube-captions" && rawAudio.backend !== "none") {
-        rawAudio = { ...rawAudio, transcription_fallback_reason: captionFallbackReason };
-      }
-
-      // 5. Align audio timestamps with the original video timeline.
-      //    Backends return timestamps relative to the cropped audio, but frames
-      //    already carry original-video timestamps via extractFrames. Shift the
-      //    audio result so both timelines match.
-      const offsetSeconds = params.start_time ? parseHMS(params.start_time) : 0;
-      const audio = shiftAudioResult(rawAudio, offsetSeconds);
-
-      // 6. Apply view_sample filtering — return only N evenly spaced frames
-      if (params.view_sample && frames.length > params.view_sample) {
-        const indices = sampleFrameIndices(frames.length, params.view_sample);
-        frames = indices.map((i) => frames[i]);
-      }
-
-      // 7. Persist session manifest
-      if (useSession && manifest && sessionDir) {
-        saveManifest(sessionDir, manifest);
-      }
-
-      // 8. Build result
-      const result: VideoWatchResult = { metadata, frames, audio };
-
-      // 9. Cleanup temp dir (only when not using session — session dir is persistent)
-      if (!useSession) {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-
-      // 10. Return as MCP content
-      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
-
-      if (resolved.source) {
-        content.push({ type: "text", text: `## Source\n${JSON.stringify(resolved.source, null, 2)}` });
-      }
-
-      // Manifest summary (only when session is active)
-      if (manifest) {
-        const manifestSummary = {
-          video_hash: manifest.video_hash,
-          resolutions: Object.fromEntries(
-            Object.entries(manifest.resolutions).map(([res, data]) => [
-              res, { frame_count: data.frames.length, timestamps: data.frames.map((f) => f.timestamp) },
-            ]),
-          ),
-        };
-        content.push({ type: "text", text: `## Session Manifest\n${JSON.stringify(manifestSummary, null, 2)}` });
-      }
-
-      // Metadata + audio as text
-      content.push({
-        type: "text",
-        text: `## Video Metadata\n${JSON.stringify(metadata, null, 2)}\n\n## Audio Analysis\n${JSON.stringify(audio, null, 2)}`,
-      });
-
-      // Frames
-      if (frameMode === "images") {
-        for (const frame of frames) {
-          content.push({
-            type: "text",
-            text: `### Frame at ${frame.timestamp}`,
+            return extractedFrames;
           });
-          if (frame.image) {
-            content.push({
-              type: "image",
-              data: frame.image,
-              mimeType: frameMimeType,
-            });
-          }
         }
-      } else {
-        // descriptions mode — return frame data for the frame-describer agent to process
+
+        let audioPromise: Promise<AudioResult>;
+
+        if (params.skip_audio || !metadata.has_audio) {
+          audioPromise = Promise.resolve({ backend: "none" as const, transcription: [], audio_tags: [], full_analysis: null });
+        } else if (captionFallbackReason === null && resolved.captions) {
+          audioPromise = Promise.resolve(
+            buildCaptionAudioResult(resolved.captions, {
+              startTime: params.start_time,
+              endTime: params.end_time,
+            }),
+          );
+        } else if (config.backend === "gemini-api") {
+          audioPromise = analyzeWithGeminiApi(safePath, config, {
+            startTime: params.start_time,
+            endTime: params.end_time,
+          });
+        } else if (config.backend === "openai") {
+          const audioDir = join(workDir, "audio");
+          audioPromise = extractAudio(safePath, audioDir, {
+            startTime: params.start_time,
+            endTime: params.end_time,
+          }).then((wavPath) => transcribeWithOpenAI(wavPath));
+        } else {
+          // local
+          const audioDir = join(workDir, "audio");
+          const modelDir = join(homedir(), ".claude-video-vision", "models");
+          audioPromise = extractAudio(safePath, audioDir, {
+            startTime: params.start_time,
+            endTime: params.end_time,
+          }).then((wavPath) =>
+            transcribeWithWhisper(wavPath, {
+              engine: config.whisper_engine,
+              model: config.whisper_model,
+              whisperAt: config.whisper_at,
+              modelDir,
+            }),
+          );
+        }
+
+        let [frames, rawAudio] = await Promise.all([framesPromise, audioPromise]);
+
+        if (captionFallbackReason !== null && rawAudio.backend !== "youtube-captions" && rawAudio.backend !== "none") {
+          rawAudio = { ...rawAudio, transcription_fallback_reason: captionFallbackReason };
+        }
+
+        // 5. Align audio timestamps with the original video timeline.
+        //    Backends return timestamps relative to the cropped audio, but frames
+        //    already carry original-video timestamps via extractFrames. Shift the
+        //    audio result so both timelines match.
+        const offsetSeconds = params.start_time ? parseHMS(params.start_time) : 0;
+        const audio = shiftAudioResult(rawAudio, offsetSeconds);
+
+        // 6. Apply view_sample filtering — return only N evenly spaced frames
+        if (params.view_sample && frames.length > params.view_sample) {
+          const indices = sampleFrameIndices(frames.length, params.view_sample);
+          frames = indices.map((i) => frames[i]);
+        }
+
+        // 7. Persist session manifest
+        if (useSession && manifest && sessionDir) {
+          saveManifest(sessionDir, manifest);
+        }
+
+        // 8. Build result
+        const result: VideoWatchResult = { metadata, frames, audio };
+
+        // 9. Return as MCP content
+        const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+
+        if (resolved.source) {
+          content.push({ type: "text", text: `## Source\n${JSON.stringify(resolved.source, null, 2)}` });
+        }
+
+        // Manifest summary (only when session is active)
+        if (manifest) {
+          const manifestSummary = {
+            video_hash: manifest.video_hash,
+            resolutions: Object.fromEntries(
+              Object.entries(manifest.resolutions).map(([res, data]) => [
+                res, { frame_count: data.frames.length, timestamps: data.frames.map((f) => f.timestamp) },
+              ]),
+            ),
+          };
+          content.push({ type: "text", text: `## Session Manifest\n${JSON.stringify(manifestSummary, null, 2)}` });
+        }
+
+        // Metadata + audio as text
         content.push({
           type: "text",
-          text: `## Frames (${frames.length} extracted at ${fps} fps)\nFrame mode is "descriptions" — use the frame-describer agent to generate text descriptions of these frames.\n\n${frames.map((f) => `- ${f.timestamp}`).join("\n")}`,
+          text: `## Video Metadata\n${JSON.stringify(metadata, null, 2)}\n\n## Audio Analysis\n${JSON.stringify(audio, null, 2)}`,
         });
-        // Still include images so the agent can describe them
-        for (const frame of frames) {
-          if (frame.image) {
+
+        // Frames
+        if (frameMode === "images") {
+          for (const frame of frames) {
             content.push({
-              type: "image",
-              data: frame.image,
-              mimeType: frameMimeType,
+              type: "text",
+              text: `### Frame at ${frame.timestamp}`,
             });
+            if (frame.image) {
+              content.push({
+                type: "image",
+                data: frame.image,
+                mimeType: frameMimeType,
+              });
+            }
+          }
+        } else {
+          // descriptions mode — return frame data for the frame-describer agent to process
+          content.push({
+            type: "text",
+            text: `## Frames (${frames.length} extracted at ${fps} fps)\nFrame mode is "descriptions" — use the frame-describer agent to generate text descriptions of these frames.\n\n${frames.map((f) => `- ${f.timestamp}`).join("\n")}`,
+          });
+          // Still include images so the agent can describe them
+          for (const frame of frames) {
+            if (frame.image) {
+              content.push({
+                type: "image",
+                data: frame.image,
+                mimeType: frameMimeType,
+              });
+            }
           }
         }
-      }
 
-      return { content: content as any };
+        return { content: content as any };
+      } finally {
+        rmSync(workDir, { recursive: true, force: true });
+      }
     },
   );
 }
